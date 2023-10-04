@@ -135,6 +135,7 @@ class Llama:
         top_p: float = 0.9,
         logprobs: bool = False,
         echo: bool = False,
+        streaming: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         """
         Generate text sequences based on provided prompts using the language generation model.
@@ -146,6 +147,7 @@ class Llama:
             top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
             logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
             echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+            streaming (bool, optional): Flag indicating whether to yield tokens as they are generated.
 
         Returns:
             Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences and, if logprobs is True, corresponding token log probabilities.
@@ -204,12 +206,17 @@ class Llama:
                     reduction="none",
                     ignore_index=pad_id,
                 )
+            if streaming:
+              yield next_token
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 next_token == self.tokenizer.eos_id
             )
             prev_pos = cur_pos
             if all(eos_reached):
                 break
+
+        if streaming:
+          return
 
         if logprobs:
             token_logprobs = token_logprobs.tolist()
@@ -288,6 +295,7 @@ class Llama:
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
+        streaming: bool = False,
     ) -> List[ChatPrediction]:
         """
         Generate assistant responses for a list of conversational dialogs using the language generation model.
@@ -361,13 +369,21 @@ class Llama:
             )
             prompt_tokens.append(dialog_tokens)
 
-        generation_tokens, generation_logprobs = self.generate(
+        generation_result = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
             temperature=temperature,
             top_p=top_p,
             logprobs=logprobs,
+            streaming=streaming,
         )
+        if streaming:
+          for tok in generation_result:
+            # yield self.tokenizer.decode(tok.item())
+            yield self.tokenizer.decode(tok.item())
+          return
+
+        generation_tokens, generation_logprobs = generation_result
         if logprobs:
             return [
                 {

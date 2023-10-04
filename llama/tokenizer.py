@@ -65,4 +65,16 @@ class Tokenizer:
         Returns:
             str: The decoded string.
         """
-        return self.sp_model.decode(t)
+        text = self.sp_model.decode(t)
+        if t:
+          start = self.sp_model.id_to_piece(t if isinstance(t, int) else t[0])
+          if start.startswith('▁'):
+            text = ' ' + text
+        return text
+
+
+    def id_to_piece(self, t: int) -> str:
+        s = self.sp_model.id_to_piece(t)
+        if s and s[0] == '▁':  # hacky way to recover prefix space.
+          s[0] = ' '
+        return s
