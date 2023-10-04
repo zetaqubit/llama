@@ -3,7 +3,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
@@ -15,6 +15,12 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
 
 @dataclass
 class ModelArgs:
@@ -26,6 +32,7 @@ class ModelArgs:
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
+    rope_theta: float = 10000
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
@@ -93,13 +100,14 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
 
-    
-        
+
+
 
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
+
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)  # type: ignore
+    freqs = torch.outer(t, freqs)  # type: ignore
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
@@ -150,15 +158,18 @@ def apply_rotary_emb(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
 
-        
+
 
     """
+    if not torch.cuda.is_available():
+        xq = xq.to('cpu')
+        xk = xk.to('cpu')
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    return xq_out.type_as(xq).to(device), xk_out.type_as(xk).to(device)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -240,7 +251,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        ).to(device)
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
@@ -248,7 +259,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        ).to(device)
 
     def forward(
         self,
@@ -435,7 +446,7 @@ class Transformer(nn.Module):
         self.n_layers = params.n_layers
 
         self.tok_embeddings = ParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
+            params.vocab_size, params.dim, init_method=lambda x: x,
         )
 
         self.layers = torch.nn.ModuleList()
@@ -448,9 +459,11 @@ class Transformer(nn.Module):
         )
 
         self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+            self.params.dim // self.params.n_heads,
+            self.params.max_seq_len * 2,
+            params.rope_theta,
         )
 
     @torch.inference_mode()
@@ -468,18 +481,18 @@ class Transformer(nn.Module):
         """
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
+        self.freqs_cis = self.freqs_cis.to("cuda" if device == "cuda" else "cpu")
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
         if seqlen > 1:
             mask = torch.full(
-                (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
+                (1, 1, seqlen, seqlen), float("-inf"), device=torch.device('cpu')
             )
-            mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+            mask = mask.to(torch.float32).triu(diagonal=start_pos+1).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, (mask.to(device) if mask is not None else mask))
         h = self.norm(h)
         output = self.output(h).float()
         return output
